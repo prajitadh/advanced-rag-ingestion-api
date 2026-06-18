@@ -6,13 +6,17 @@ from sqlalchemy.orm import Session
 
 from app.database.db import get_db
 from app.database.models import Document
+
 from app.utils.file_loader import (
     extract_text_from_pdf,
     extract_text_from_txt
 )
 
-router = APIRouter()
+from app.services.chunking import chunk_text
+from app.services.embeddings import get_embeddings
+from app.vectorstore.qdrant_client import create_collection, upsert_chunks
 
+router = APIRouter()
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -33,7 +37,7 @@ async def upload_file(
             detail="Only PDF and TXT files are supported"
         )
 
-    #  Save file locally
+    # Save file
     file_path = os.path.join(UPLOAD_DIR, filename)
 
     with open(file_path, "wb") as buffer:
@@ -42,28 +46,48 @@ async def upload_file(
     # Extract text
     if file_ext == "pdf":
         text = extract_text_from_pdf(file_path)
-        strategy = "pdf"
     else:
         text = extract_text_from_txt(file_path)
-        strategy = "txt"
 
-    # Store metadata in document DB
+    # Ensure file isn't empty
+    if not text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="No text could be extracted from the file."
+        )
+
+    # Chunk text
+    chunks = chunk_text(text, strategy="recursive")
+
+    # Save document metadata
     document = Document(
         filename=filename,
         file_type=file_ext,
-        chunking_strategy=strategy,
+        chunking_strategy="recursive",
         uploaded_at=datetime.utcnow()
     )
 
-    #
     db.add(document)
     db.commit()
     db.refresh(document)
 
-    # Return response
+    # Generate embeddings
+    embeddings = get_embeddings(chunks)
+
+    # Create Qdrant collection if it doesn't exist
+    create_collection()
+
+    # Store vectors
+    upsert_chunks(
+        chunks=chunks,
+        embeddings=embeddings,
+        document_id=document.id
+    )
+
     return {
         "message": "File uploaded successfully",
         "document_id": document.id,
         "filename": filename,
-        "extracted_text_preview": text[:500]  
+        "chunks_created": len(chunks),
+        "preview": text[:300]
     }
